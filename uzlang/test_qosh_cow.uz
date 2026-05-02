@@ -1,0 +1,33 @@
+yoz "qosh COW Test"
+a = [1, 2]
+b = a
+yoz "a initially: " + matn(a)
+yoz "b initially: " + matn(b)
+
+yoz "Adding 3 to a: a = qosh(a, 3)"
+a = qosh(a, 3)
+
+yoz "a after: " + matn(a)
+yoz "b after: " + matn(b)
+
+success = 0
+agar uzunlik(a) == 3 {
+    agar uzunlik(b) == 2 {
+        yoz "SUCCESS: b did not change when a was updated via qosh."
+        success = 1
+    }
+}
+
+agar success == 0 {
+    yoz "FAILURE: COW failed for qosh"
+}
+
+yoz "In-place update test"
+c = [10]
+c = qosh(c, 11)
+yoz "c after qosh: " + matn(c)
+agar c[0] == 10 {
+    agar c[1] == 11 {
+        yoz "SUCCESS: c updated correctly."
+    }
+}

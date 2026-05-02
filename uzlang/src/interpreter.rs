@@ -1,0 +1,756 @@
+use crate::parser::{Expr, Stmt};
+use std::collections::HashMap;
+use std::io::Read;
+use std::net::ToSocketAddrs;
+use std::rc::Rc;
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Number(i64),
+    String(Rc<str>),
+    Bool(bool),
+    Array(Rc<Vec<Value>>),
+}
+
+impl Value {
+    pub fn empty_string() -> Self {
+        Value::String(Rc::from(""))
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Value::Number(n) => write!(f, "{}", n),
+            Value::String(s) => write!(f, "{}", s),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::Array(arr) => {
+                write!(f, "[")?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+// Use Rc<str> for function parameters to avoid string cloning on every function call.
+type FunctionDef = (Rc<Vec<Rc<str>>>, Rc<Vec<Stmt>>);
+
+const MAX_CALL_DEPTH: u32 = 100;
+
+pub struct Interpreter {
+    env_stack: Vec<HashMap<Rc<str>, Value>>,
+    functions: HashMap<String, FunctionDef>,
+    call_depth: u32,
+}
+
+fn is_safe_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            // Loopback 127.0.0.0/8
+            if octets[0] == 127 {
+                return false;
+            }
+            // Private 10.0.0.0/8
+            if octets[0] == 10 {
+                return false;
+            }
+            // Private 172.16.0.0/12
+            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                return false;
+            }
+            // Private 192.168.0.0/16
+            if octets[0] == 192 && octets[1] == 168 {
+                return false;
+            }
+            // Link-local 169.254.0.0/16
+            if octets[0] == 169 && octets[1] == 254 {
+                return false;
+            }
+            // Current network 0.0.0.0/8
+            if octets[0] == 0 {
+                return false;
+            }
+            // CGNAT 100.64.0.0/10
+            if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+                return false;
+            }
+            // 192.0.0.0/24 (IETF Protocol Assignments)
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+                return false;
+            }
+            // 192.0.2.0/24 (TEST-NET-1)
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+                return false;
+            }
+            // 198.51.100.0/24 (TEST-NET-2)
+            if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+                return false;
+            }
+            // 203.0.113.0/24 (TEST-NET-3)
+            if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+                return false;
+            }
+            // 198.18.0.0/15 (Network Interconnect Device Benchmark Testing)
+            if octets[0] == 198 && (18..=19).contains(&octets[1]) {
+                return false;
+            }
+            // 224.0.0.0/4 (Multicast)
+            if (octets[0] & 0xf0) == 0xe0 {
+                return false;
+            }
+            // 240.0.0.0/4 (Reserved)
+            if (octets[0] & 0xf0) == 0xf0 {
+                return false;
+            }
+            // Broadcast 255.255.255.255
+            if octets == [255, 255, 255, 255] {
+                return false;
+            }
+            // IETF Protocol Assignments 192.0.0.0/24
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+                return false;
+            }
+            // TEST-NET-1 192.0.2.0/24
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+                return false;
+            }
+            // TEST-NET-2 198.51.100.0/24
+            if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+                return false;
+            }
+            // TEST-NET-3 203.0.113.0/24
+            if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+                return false;
+            }
+            // Benchmarking 198.18.0.0/15
+            if octets[0] == 198 && (18..=19).contains(&octets[1]) {
+                return false;
+            }
+            // Multicast 224.0.0.0/4
+            if (octets[0] & 0xf0) == 0xe0 {
+                return false;
+            }
+            // Reserved 240.0.0.0/4
+            if (octets[0] & 0xf0) == 0xf0 {
+                return false;
+            }
+            true
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() {
+                return false;
+            }
+            if ipv6.is_unspecified() {
+                return false;
+            }
+            let segments = ipv6.segments();
+            // Unique local fc00::/7
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // Link-local fe80::/10
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // Documentation 2001:db8::/32
+            if segments[0] == 0x2001 && segments[1] == 0xdb8 {
+                return false;
+            }
+            // Multicast ff00::/8
+            if (segments[0] & 0xff00) == 0xff00 {
+                return false;
+            }
+            // IPv4-mapped ::ffff:0:0/96
+            if let Some(ipv4) = ipv6.to_ipv4() {
+                return is_safe_ip(std::net::IpAddr::V4(ipv4));
+            }
+            // Multicast ff00::/8
+            if (segments[0] & 0xff00) == 0xff00 {
+                return false;
+            }
+            // Documentation 2001:db8::/32
+            if segments[0] == 0x2001 && segments[1] == 0xdb8 {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+fn create_safe_client(url_str: &str) -> Result<(reqwest::blocking::Client, String), &'static str> {
+    if let Ok(url) = reqwest::Url::parse(url_str) {
+        if url.scheme() != "http" && url.scheme() != "https" {
+            return Err("Faqat HTTP/HTTPS ruxsat etilgan");
+        }
+        if let Some(host) = url.host_str() {
+            // Defense in depth: Check known bad hosts (string based)
+            if host == "localhost" || host == "::1" || host == "[::1]" || host.starts_with("127.") {
+                return Err("Mahalliy yoki xususiy tarmoqqa ulanish taqiqlangan");
+            }
+
+            // Resolve DNS and pick the first valid address to pin
+            let port = url.port_or_known_default().unwrap_or(80);
+            let addr_str = format!("{}:{}", host, port);
+
+            if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+                if let Some(addr) = addrs.next() {
+                    // Check if the resolved IP is safe
+                    if !is_safe_ip(addr.ip()) {
+                        return Err("Mahalliy yoki xususiy tarmoqqa ulanish taqiqlangan");
+                    }
+
+                    // Pin the resolved IP address to prevent DNS rebinding/TOCTOU
+                    let client = reqwest::blocking::Client::builder()
+                        .resolve(host, addr)
+                        .redirect(reqwest::redirect::Policy::none())
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .map_err(|_| "Mijoz yaratishda xatolik")?;
+
+                    return Ok((client, url_str.to_string()));
+                }
+            }
+        }
+    }
+    Err("Noto'g'ri manzil format")
+}
+
+const MAX_RESPONSE_SIZE: u64 = 5 * 1024 * 1024;
+
+impl Interpreter {
+    pub fn new() -> Self {
+        Interpreter {
+            env_stack: vec![HashMap::new()],
+            functions: HashMap::new(),
+            call_depth: 0,
+        }
+    }
+
+    pub fn set_variable(&mut self, name: &str, val: Value) {
+        for scope in self.env_stack.iter_mut().rev() {
+            if let Some(existing_val) = scope.get_mut(name) {
+                *existing_val = val;
+                return;
+            }
+        }
+
+        if let Some(scope) = self.env_stack.last_mut() {
+            scope.insert(Rc::from(name), val);
+        }
+    }
+
+    pub fn get_variable(&self, name: &str) -> Value {
+        for scope in self.env_stack.iter().rev() {
+            if let Some(val) = scope.get(name) {
+                return val.clone();
+            }
+        }
+        Value::Number(0)
+    }
+
+    pub fn execute(&mut self, stmts: &[Stmt]) -> Option<Value> {
+        for stmt in stmts {
+            if let Some(val) = self.execute_stmt(stmt) {
+                return Some(val);
+            }
+        }
+        None
+    }
+
+    fn execute_stmt(&mut self, stmt: &Stmt) -> Option<Value> {
+        match stmt {
+            Stmt::Print(expr) => {
+                let val = self.evaluate(expr);
+                println!("{}", val);
+                None
+            }
+            Stmt::If(cond, body) => {
+                let val = self.evaluate(cond);
+                if self.is_truthy(val) {
+                    return self.execute(body);
+                }
+                None
+            }
+            Stmt::Loop(cond, body) => {
+                while {
+                    let val = self.evaluate(cond);
+                    self.is_truthy(val)
+                } {
+                    if let Some(ret) = self.execute(body) {
+                        return Some(ret);
+                    }
+                }
+                None
+            }
+            Stmt::For(var_name, collection, body) => {
+                let collection_val = self.evaluate(collection);
+                if let Value::Array(elements) = collection_val {
+                    let var_name_rc: Rc<str> = Rc::from(var_name.as_str());
+                    // Optimization: Reuse the same HashMap for scope to avoid allocation in every iteration
+                    let mut scope = HashMap::new();
+                    for element in elements.iter() {
+                        scope.insert(var_name_rc.clone(), element.clone());
+                        self.env_stack.push(scope);
+
+                        let ret = self.execute(body);
+                        // Retrieve the scope to reuse it
+                        scope = self.env_stack.pop().expect("Stack error in For loop");
+                        // Clear variables declared in the loop body, but keep allocation
+                        scope.clear();
+
+                        if let Some(val) = ret {
+                            return Some(val);
+                        }
+                    }
+                } else {
+                    eprintln!("Xatolik: 'uchun' faqat massivlar bilan ishlaydi");
+                }
+                None
+            }
+            Stmt::Assign(name, expr) => {
+                // Bolt optimization for arr = qosh(arr, item) pattern
+                if let Expr::Call(func_name, args) = expr {
+                    if func_name == "qosh" && args.len() == 2 {
+                        if let Expr::Identifier(var_name) = &args[0] {
+                            if var_name == name {
+                                // Evaluate the item first to respect side effects
+                                let item = self.evaluate(&args[1]);
+                                // Try to find the array in the environment and mutate it in-place
+                                for scope in self.env_stack.iter_mut().rev() {
+                                    if let Some(val) = scope.get_mut(name.as_str()) {
+                                        if let Value::Array(rc_arr) = val {
+                                            Rc::make_mut(rc_arr).push(item);
+                                            return None;
+                                        }
+                                        break;
+                                    }
+                                }
+                                // Fallback: if not found or not an array, do regular set (but avoid double eval)
+                                let arr_val = self.get_variable(name);
+                                if let Value::Array(rc_arr) = arr_val {
+                                    let mut arr = (*rc_arr).clone();
+                                    arr.push(item);
+                                    self.set_variable(name, Value::Array(Rc::new(arr)));
+                                } else {
+                                    // It was either not found (so it's 0) or not an array.
+                                    // qosh(non-array, item) returns 0 as per current implementation
+                                    self.set_variable(name, Value::Number(0));
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                }
+                let val = self.evaluate(expr);
+                self.set_variable(name, val);
+                None
+            }
+            Stmt::AssignIndex(name, index_expr, value_expr) => {
+                let index_val = self.evaluate(index_expr);
+                let value_val = self.evaluate(value_expr);
+
+                let mut found = false;
+                for scope in self.env_stack.iter_mut().rev() {
+                    if let Some(val) = scope.get_mut(name.as_str()) {
+                        found = true;
+                        if let Value::Array(rc_arr) = val {
+                            if let Value::Number(idx) = index_val {
+                                let elements = Rc::make_mut(rc_arr);
+                                if idx >= 0 && (idx as usize) < elements.len() {
+                                    elements[idx as usize] = value_val;
+                                } else {
+                                    eprintln!("Xatolik: Indeks chegaradan tashqarida: {}", idx);
+                                }
+                            } else {
+                                eprintln!("Xatolik: Indeks raqam bo'lishi kerak");
+                            }
+                        } else {
+                            eprintln!("Xatolik: O'zgaruvchi massiv emas: {}", name);
+                        }
+                        break;
+                    }
+                }
+                if !found {
+                    eprintln!("Xatolik: O'zgaruvchi topilmadi: {}", name);
+                }
+
+                None
+            }
+            Stmt::Function(name, params, body) => {
+                let params_rc: Vec<Rc<str>> = params.iter().map(|p| Rc::from(p.as_str())).collect();
+                self.functions
+                    .insert(name.clone(), (Rc::new(params_rc), Rc::new(body.clone())));
+                None
+            }
+            Stmt::Return(expr) => Some(self.evaluate(expr)),
+            Stmt::Expr(expr) => {
+                self.evaluate(expr);
+                None
+            }
+        }
+    }
+
+    fn evaluate(&mut self, expr: &Expr) -> Value {
+        match expr {
+            Expr::Number(n) => Value::Number(*n),
+            Expr::StringLiteral(s) => Value::String(Rc::from(s.as_str())),
+            Expr::Identifier(name) => self.get_variable(name),
+            Expr::Input => {
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    Value::String(Rc::from(input.trim()))
+                } else {
+                    Value::empty_string()
+                }
+            }
+            Expr::Array(elements) => {
+                // Bolt: Pre-allocate vector capacity to avoid reallocation
+                let mut values = Vec::with_capacity(elements.len());
+                for e in elements {
+                    values.push(self.evaluate(e));
+                }
+                Value::Array(Rc::new(values))
+            }
+            Expr::Index(target, index) => {
+                let target_val = self.evaluate(target);
+                let index_val = self.evaluate(index);
+
+                if let Value::Array(elements) = target_val {
+                    if let Value::Number(idx) = index_val {
+                        if idx >= 0 && (idx as usize) < elements.len() {
+                            elements[idx as usize].clone()
+                        } else {
+                            eprintln!("Xatolik: Indeks chegaradan tashqarida: {}", idx);
+                            Value::Number(0)
+                        }
+                    } else {
+                        eprintln!("Xatolik: Indeks raqam bo'lishi kerak");
+                        Value::Number(0)
+                    }
+                } else {
+                    eprintln!("Xatolik: Massiv indekslanishi kerak");
+                    Value::Number(0)
+                }
+            }
+            Expr::Call(name, args) => {
+                // Bolt: Pre-allocate vector capacity to avoid reallocation
+                let mut arg_values = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_values.push(self.evaluate(arg));
+                }
+
+                // Native functions
+                let mut arg_iter = arg_values.into_iter();
+                match name.as_str() {
+                    "son" => {
+                        if let Some(val) = arg_iter.next() {
+                            match val {
+                                Value::String(s) => {
+                                    return Value::Number(s.trim().parse().unwrap_or(0));
+                                }
+                                Value::Number(n) => return Value::Number(n),
+                                _ => return Value::Number(0),
+                            }
+                        }
+                        return Value::Number(0);
+                    }
+                    "matn" => {
+                        if let Some(val) = arg_iter.next() {
+                            if let Value::String(s) = val {
+                                return Value::String(s);
+                            }
+                            return Value::String(Rc::from(val.to_string()));
+                        }
+                        return Value::empty_string();
+                    }
+                    "turi" => {
+                        if let Some(val) = arg_iter.next() {
+                            match val {
+                                Value::Number(_) => return Value::String(Rc::from("son")),
+                                Value::String(_) => return Value::String(Rc::from("matn")),
+                                Value::Bool(_) => return Value::String(Rc::from("mantiq")),
+                                Value::Array(_) => return Value::String(Rc::from("massiv")),
+                            }
+                        }
+                        return Value::String(Rc::from("noma'lum"));
+                    }
+                    "uzunlik" => {
+                        if let Some(val) = arg_iter.next() {
+                            if let Value::Array(arr) = val {
+                                return Value::Number(arr.len() as i64);
+                            }
+                        }
+                        return Value::Number(0);
+                    }
+                    "qosh" => {
+                        // qosh(arr, val) -> returns new array
+                        let arr_opt = arg_iter.next();
+                        let item_opt = arg_iter.next();
+                        if let (Some(Value::Array(mut rc_arr)), Some(item)) = (arr_opt, item_opt) {
+                            Rc::make_mut(&mut rc_arr).push(item);
+                            return Value::Array(rc_arr);
+                        } else {
+                            eprintln!(
+                                "Xatolik: 'qosh' funksiyasining birinchi parametri massiv bo'lishi kerak"
+                            );
+                        }
+                        return Value::Number(0);
+                    }
+                    "internet_ol" => {
+                        if let Some(val) = arg_iter.next() {
+                            let url_str = val.to_string();
+
+                            match create_safe_client(&url_str) {
+                                Ok((client, url)) => match client.get(url).send() {
+                                    Ok(resp) => {
+                                        let mut buffer = String::new();
+                                        if resp
+                                            .take(MAX_RESPONSE_SIZE)
+                                            .read_to_string(&mut buffer)
+                                            .is_err()
+                                        {
+                                            eprintln!("Xatolik: Javobni o'qishda xatolik");
+                                            return Value::empty_string();
+                                        }
+                                        return Value::String(Rc::from(buffer));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Xatolik: Internet so'rovida xatolik: {}", e);
+                                        return Value::empty_string();
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("Xatolik: Xavfsizlik qoidasi buzildi: {}", e);
+                                    return Value::empty_string();
+                                }
+                            }
+                        }
+                        return Value::empty_string();
+                    }
+                    "internet_yoz" => {
+                        let url_opt = arg_iter.next();
+                        let json_opt = arg_iter.next();
+                        if let (Some(url_val), Some(json_val)) = (url_opt, json_opt) {
+                            let url_str = url_val.to_string();
+                            let json_data = json_val.to_string();
+
+                            match create_safe_client(&url_str) {
+                                Ok((client, url)) => {
+                                    match client
+                                        .post(url)
+                                        .header("Content-Type", "application/json")
+                                        .body(json_data)
+                                        .send()
+                                    {
+                                        Ok(resp) => {
+                                            let mut buffer = String::new();
+                                            if resp
+                                                .take(MAX_RESPONSE_SIZE)
+                                                .read_to_string(&mut buffer)
+                                                .is_err()
+                                            {
+                                                eprintln!("Xatolik: Javobni o'qishda xatolik");
+                                                return Value::empty_string();
+                                            }
+                                            return Value::String(Rc::from(buffer));
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Xatolik: Internet so'rovida xatolik: {}", e);
+                                            return Value::empty_string();
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Xatolik: Xavfsizlik qoidasi buzildi: {}", e);
+                                    return Value::empty_string();
+                                }
+                            }
+                        }
+                        return Value::empty_string();
+                    }
+                    _ => {}
+                }
+
+                // User functions
+                if let Some((params, body)) = self.functions.get(name) {
+                    if self.call_depth >= MAX_CALL_DEPTH {
+                        eprintln!("Xatolik: Rekursiya chuqurligi juda katta");
+                        return Value::Number(0);
+                    }
+
+                    let params = Rc::clone(params);
+                    let body = Rc::clone(body);
+
+                    // Create new scope
+                    // Bolt: Pre-allocate HashMap capacity to avoid reallocation for function scopes
+                    let mut scope = HashMap::with_capacity(params.len());
+                    for param in params.iter() {
+                        if let Some(val) = arg_iter.next() {
+                            scope.insert(param.clone(), val);
+                        } else {
+                            // Default value for missing args?
+                            scope.insert(param.clone(), Value::Number(0));
+                        }
+                    }
+
+                    self.call_depth += 1;
+                    self.env_stack.push(scope);
+                    let result = self.execute(&body);
+                    self.env_stack.pop();
+                    self.call_depth -= 1;
+
+                    return result.unwrap_or(Value::Number(0)); // Default return 0
+                }
+
+                eprintln!("Xatolik: Funksiya topilmadi: {}", name);
+                Value::Number(0)
+            }
+            Expr::UnaryOp(op, right) => {
+                let val = self.evaluate(right);
+                match op.as_str() {
+                    "!" => Value::Bool(!self.is_truthy(val)),
+                    _ => Value::Bool(false),
+                }
+            }
+            Expr::BinaryOp(left, op, right) => {
+                if op == "&&" {
+                    let l = self.evaluate(left);
+                    if !self.is_truthy(l) {
+                        return Value::Bool(false);
+                    }
+                    let r = self.evaluate(right);
+                    return Value::Bool(self.is_truthy(r));
+                }
+                if op == "||" {
+                    let l = self.evaluate(left);
+                    if self.is_truthy(l) {
+                        return Value::Bool(true);
+                    }
+                    let r = self.evaluate(right);
+                    return Value::Bool(self.is_truthy(r));
+                }
+                let l = self.evaluate(left);
+                let r = self.evaluate(right);
+                self.evaluate_binary(l, op, r)
+            }
+        }
+    }
+
+    fn evaluate_binary(&self, left: Value, op: &str, right: Value) -> Value {
+        match (left, right) {
+            (Value::Number(l), Value::Number(r)) => match op {
+                "+" => l.checked_add(r).map(Value::Number).unwrap_or_else(|| {
+                    eprintln!("Xatolik: Arifmetik xato");
+                    Value::Number(0)
+                }),
+                "-" => l.checked_sub(r).map(Value::Number).unwrap_or_else(|| {
+                    eprintln!("Xatolik: Arifmetik xato");
+                    Value::Number(0)
+                }),
+                "*" => l.checked_mul(r).map(Value::Number).unwrap_or_else(|| {
+                    eprintln!("Xatolik: Arifmetik xato");
+                    Value::Number(0)
+                }),
+                "/" => l.checked_div(r).map(Value::Number).unwrap_or_else(|| {
+                    eprintln!("Xatolik: Arifmetik xato");
+                    Value::Number(0)
+                }),
+                "==" => Value::Bool(l == r),
+                "!=" => Value::Bool(l != r),
+                ">" => Value::Bool(l > r),
+                "<" => Value::Bool(l < r),
+                ">=" => Value::Bool(l >= r),
+                "<=" => Value::Bool(l <= r),
+                _ => Value::Bool(false),
+            },
+            (Value::String(l), Value::String(r)) => match op {
+                "+" => {
+                    if l.is_empty() { return Value::String(r); }
+                    if r.is_empty() { return Value::String(l); }
+                    let mut new_str = String::with_capacity(l.len() + r.len());
+                    new_str.push_str(&l);
+                    new_str.push_str(&r);
+                    Value::String(Rc::from(new_str))
+                },
+                "==" => Value::Bool(l == r),
+                "!=" => Value::Bool(l != r),
+                _ => Value::Bool(false),
+            },
+            (Value::String(l), Value::Number(r)) => match op {
+                "+" => {
+                    let r_str = r.to_string();
+                    let mut new_str = String::with_capacity(l.len() + r_str.len());
+                    new_str.push_str(&l);
+                    new_str.push_str(&r_str);
+                    Value::String(Rc::from(new_str))
+                },
+                _ => Value::Bool(false),
+            },
+            (Value::Number(l), Value::String(r)) => match op {
+                "+" => {
+                    let l_str = l.to_string();
+                    let mut new_str = String::with_capacity(l_str.len() + r.len());
+                    new_str.push_str(&l_str);
+                    new_str.push_str(&r);
+                    Value::String(Rc::from(new_str))
+                },
+                _ => Value::Bool(false),
+            },
+            _ => Value::Bool(false),
+        }
+    }
+
+    fn is_truthy(&self, val: Value) -> bool {
+        match val {
+            Value::Bool(b) => b,
+            Value::Number(n) => n != 0,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_ip_v4() {
+        assert!(!is_safe_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_safe_ip("10.0.0.1".parse().unwrap()));
+        assert!(!is_safe_ip("192.168.1.1".parse().unwrap()));
+        assert!(!is_safe_ip("172.16.0.1".parse().unwrap()));
+        assert!(!is_safe_ip("169.254.1.1".parse().unwrap()));
+        assert!(!is_safe_ip("0.0.0.0".parse().unwrap()));
+        assert!(!is_safe_ip("100.64.0.1".parse().unwrap())); // CGNAT
+        assert!(!is_safe_ip("192.0.0.1".parse().unwrap())); // IETF Protocol
+        assert!(!is_safe_ip("192.0.2.1".parse().unwrap())); // TEST-NET-1
+        assert!(!is_safe_ip("198.51.100.1".parse().unwrap())); // TEST-NET-2
+        assert!(!is_safe_ip("203.0.113.1".parse().unwrap())); // TEST-NET-3
+        assert!(!is_safe_ip("198.18.0.1".parse().unwrap())); // Benchmark
+        assert!(!is_safe_ip("224.0.0.1".parse().unwrap())); // Multicast
+        assert!(!is_safe_ip("240.0.0.1".parse().unwrap())); // Reserved
+        assert!(!is_safe_ip("255.255.255.255".parse().unwrap())); // Broadcast
+        assert!(is_safe_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_safe_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_safe_ip_v6() {
+        assert!(!is_safe_ip("::1".parse().unwrap()));
+        assert!(!is_safe_ip("::".parse().unwrap()));
+        assert!(!is_safe_ip("fc00::1".parse().unwrap()));
+        assert!(!is_safe_ip("fe80::1".parse().unwrap()));
+        assert!(!is_safe_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_safe_ip("ff02::1".parse().unwrap())); // Multicast
+        assert!(!is_safe_ip("2001:db8::1".parse().unwrap())); // Documentation
+        assert!(is_safe_ip("2001:4860:4860::8888".parse().unwrap())); // Google DNS
+    }
+}
